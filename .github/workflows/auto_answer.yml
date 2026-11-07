@@ -1,0 +1,35 @@
+name: Auto Answer (2 hours)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "50 13 * * *"
+
+concurrency:
+  group: auto-answer
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Tesseract
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+
+      - name: Install Python packages
+        run: pip install telethon pytesseract pillow
+
+      - name: Run bot for 2 hours, then stop
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION: ${{ secrets.SESSION }}
+          CHANNEL: ${{ secrets.CHANNEL }}
+        run: timeout 120m python -u auto_answer.py || true
