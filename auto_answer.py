@@ -15,6 +15,7 @@ import pytesseract
 from PIL import Image, ImageOps
 from telethon import TelegramClient, events, errors, utils
 from telethon.tl.functions.messages import GetDiscussionMessageRequest
+from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.sessions import StringSession
 
 logging.basicConfig(level=logging.WARNING)   # shows Telethon warnings (server errors, flood waits) in the log
@@ -44,7 +45,7 @@ OCR_CONFIG = "--oem 1 --psm 6"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return json.load(f, parse_float=str)   # keep numbers exactly as written: 1.47850 stays "1.47850"
 
 
 # Load everything ONCE at startup (in memory = fast)
@@ -183,11 +184,29 @@ async def handler(event):
 async def main():
     await client.start()
     global CHANNEL_INPUT
+
+    me = await client.get_me()
+    me_name = f"@{me.username}" if me.username else (me.first_name or str(me.id))
+    print(f"Account: {me_name}")
+
     CHANNEL_INPUT = await client.get_input_entity(CHANNEL)   # resolve once, not per post
     entity = await client.get_entity(CHANNEL_INPUT)
     name = getattr(entity, "title", None) or CHANNEL
     username = f" (@{entity.username})" if getattr(entity, "username", None) else ""
     print(f"Watching channel: {name}{username} ... (Ctrl+C to stop)")
+
+    try:
+        full = await client(GetFullChannelRequest(CHANNEL_INPUT))
+        linked_id = full.full_chat.linked_chat_id
+        if linked_id:
+            group = await client.get_entity(linked_id)
+            g_user = f" (@{group.username})" if getattr(group, "username", None) else ""
+            print(f"Comments go to group: {getattr(group, 'title', linked_id)}{g_user}")
+        else:
+            print("[!] This channel has no linked discussion group, so comments will fail")
+    except Exception as e:
+        print(f"[!] Could not check the linked group: {e}")
+
     await client.run_until_disconnected()
 
 
