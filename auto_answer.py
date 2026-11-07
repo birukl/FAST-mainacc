@@ -119,6 +119,41 @@ client = TelegramClient(StringSession(SESSION) if SESSION else "auto_answer_sess
 
 
 CHANNEL_INPUT = None   # resolved once at startup
+CHANNEL_ID = None      # numeric id of the channel (to recognise its copies in the group)
+GROUP_INPUT = None     # linked discussion group (input peer), resolved once at startup
+
+# post id in channel -> Future that receives (group_peer, message_id_in_group)
+thread_futs = {}
+
+
+def thread_future(post_id):
+    fut = thread_futs.get(post_id)
+    if fut is None:
+        fut = asyncio.get_running_loop().create_future()
+        thread_futs[post_id] = fut
+    return fut
+
+
+def prune_futures():
+    # keep memory small: forget the oldest entries if too many pile up
+    if len(thread_futs) > 300:
+        for k in sorted(thread_futs)[:150]:
+            thread_futs.pop(k, None)
+
+
+async def on_group_copy(event):
+    """The channel post appeared in the discussion group -> that message is the comment target."""
+    m = event.message
+    fwd = m.fwd_from
+    if not fwd or not fwd.channel_post:
+        return
+    src = getattr(fwd.from_id, "channel_id", None)
+    if CHANNEL_ID is not None and src is not None and src != CHANNEL_ID:
+        return
+    fut = thread_future(fwd.channel_post)
+    if not fut.done():
+        fut.set_result((GROUP_INPUT, m.id))
+    prune_futures()
 
 
 async def get_discussion_target(post_id, give_up=10.0):
@@ -137,7 +172,7 @@ async def get_discussion_target(post_id, give_up=10.0):
             m = r.messages[0]
             chat = next(c for c in r.chats if c.id == m.peer_id.channel_id)
             if tries > 1:
-                print(f"[debug] thread found after {tries} tries, last error: {last_err!r}")
+                print(f"[debug] lookup found thread after {tries} tries, last error: {last_err!r}")
             return utils.get_input_peer(chat), m.id
         except asyncio.TimeoutError:
             last_err = "timeout"         # Telethon was sleeping on a server error -> retry now
@@ -145,6 +180,33 @@ async def get_discussion_target(post_id, give_up=10.0):
             last_err = e
             await asyncio.sleep(0.05)    # post's comment thread not ready yet
     return None
+
+
+async def resolve_target(post_id):
+    """Race: group listener vs. direct lookup. Whoever gets the thread first wins."""
+    fut = thread_future(post_id)
+    if fut.done():
+        print("[thread] ready before needed (group event)")
+        thread_futs.pop(post_id, None)
+        return fut.result()
+    poll = asyncio.create_task(get_discussion_target(post_id))
+    try:
+        done, _ = await asyncio.wait({fut, poll}, return_when=asyncio.FIRST_COMPLETED)
+        if fut in done:
+            print("[thread] won by group event")
+            return fut.result()
+        res = poll.result()
+        if res:
+            print("[thread] won by lookup")
+            return res
+        # lookup gave up: wait a little longer for the group event
+        try:
+            return await asyncio.wait_for(asyncio.shield(fut), 5)
+        except asyncio.TimeoutError:
+            return None
+    finally:
+        poll.cancel()
+        thread_futs.pop(post_id, None)
 
 
 @client.on(events.NewMessage(chats=CHANNEL))
@@ -159,8 +221,8 @@ async def handler(event):
     answered.add(msg.id)  # mark first so we never comment twice
 
     t0 = time.perf_counter()
-    # start looking up the comment thread NOW, while we download + OCR the image
-    target_task = asyncio.create_task(get_discussion_target(msg.id))
+    # start looking for the comment thread NOW, while we download + OCR the image
+    target_task = asyncio.create_task(resolve_target(msg.id))
 
     image_bytes = await msg.download_media(bytes)   # in memory, no disk
     t1 = time.perf_counter()
@@ -189,7 +251,7 @@ async def handler(event):
 
 async def main():
     await client.start()
-    global CHANNEL_INPUT
+    global CHANNEL_INPUT, CHANNEL_ID, GROUP_INPUT
 
     me = await client.get_me()
     me_name = f"@{me.username}" if me.username else (me.first_name or str(me.id))
@@ -197,6 +259,7 @@ async def main():
 
     CHANNEL_INPUT = await client.get_input_entity(CHANNEL)   # resolve once, not per post
     entity = await client.get_entity(CHANNEL_INPUT)
+    CHANNEL_ID = entity.id
     name = getattr(entity, "title", None) or CHANNEL
     username = f" (@{entity.username})" if getattr(entity, "username", None) else ""
     print(f"Watching channel: {name}{username} ... (Ctrl+C to stop)")
@@ -206,8 +269,12 @@ async def main():
         linked_id = full.full_chat.linked_chat_id
         if linked_id:
             group = await client.get_entity(linked_id)
+            GROUP_INPUT = utils.get_input_peer(group)
             g_user = f" (@{group.username})" if getattr(group, "username", None) else ""
             print(f"Comments go to group: {getattr(group, 'title', linked_id)}{g_user}")
+            # listen to the group: its copy of each channel post is the fastest way to know the target
+            client.add_event_handler(on_group_copy, events.NewMessage(chats=group))
+            print("Listening to the group for instant comment targets")
         else:
             print("[!] This channel has no linked discussion group, so comments will fail")
     except Exception as e:
