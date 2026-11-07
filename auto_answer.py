@@ -122,6 +122,8 @@ CHANNEL_INPUT = None   # resolved once at startup
 
 
 async def get_discussion_target(post_id, give_up=10.0):
+    """Find the comment thread of a post. Telethon sleeps 2s after every Telegram server error,
+    which is what made 'send' take 2.4s / 4.5s. Here a slow try is cancelled and repeated at once."""
     start = time.perf_counter()
     tries = 0
     last_err = None
@@ -138,11 +140,12 @@ async def get_discussion_target(post_id, give_up=10.0):
                 print(f"[debug] thread found after {tries} tries, last error: {last_err!r}")
             return utils.get_input_peer(chat), m.id
         except asyncio.TimeoutError:
-            last_err = "timeout"
+            last_err = "timeout"         # Telethon was sleeping on a server error -> retry now
         except errors.RPCError as e:
             last_err = e
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.05)    # post's comment thread not ready yet
     return None
+
 
 @client.on(events.NewMessage(chats=CHANNEL))
 async def handler(event):
