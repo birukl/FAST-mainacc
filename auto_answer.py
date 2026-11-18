@@ -9,6 +9,7 @@ import json
 import re
 import time
 import logging
+import threading
 
 try:
     import winsound  # Windows beep (not on Linux/cloud)
@@ -43,6 +44,9 @@ CROP_FRAC = (20 / 720, 315 / 1280, 700 / 720, 410 / 1280)
 LOOKUP_TIMEOUT = 0.5               # seconds before a slow discussion lookup is retried
 SEND_TIMEOUT = 0.8                 # seconds before a slow send is re-sent (same random_id = no duplicate)
 UPSCALE = 1
+# None = download the biggest photo size (best OCR). -2 = next smaller size: smaller file, faster
+# download, but TEST that OCR still reads every question correctly before using it.
+DOWNLOAD_THUMB = None
 
 TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 if os.name == "nt":
@@ -53,7 +57,7 @@ OCR_CONFIG = "--oem 1 --psm 6"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return json.load(f, parse_float=str)   # keep numbers exactly as written
 
 
 raw = load_json(DATA_FILE)
@@ -87,6 +91,29 @@ def alert(text):
         winsound.Beep(900, 400)
 
 
+OCR_API = None                 # tesserocr engine kept loaded in memory (much faster than pytesseract)
+OCR_LOCK = threading.Lock()
+
+
+def init_ocr():
+    """Optional speed-up: tesserocr runs Tesseract inside this process, so there is no new
+    process + model load for every image. If it is not installed we silently use pytesseract."""
+    global OCR_API
+    try:
+        import tesserocr
+        kwargs = {"lang": "eng", "psm": tesserocr.PSM.SINGLE_BLOCK, "oem": tesserocr.OEM.LSTM_ONLY}
+        path = os.environ.get("TESSDATA_PREFIX")
+        if not path and os.name == "nt":
+            path = r"C:\Program Files\Tesseract-OCR\tessdata"
+        if path:
+            kwargs["path"] = path
+        OCR_API = tesserocr.PyTessBaseAPI(**kwargs)
+        print("OCR engine: tesserocr (in-process, fast)")
+    except Exception as e:
+        OCR_API = None
+        print(f"OCR engine: pytesseract (tesserocr not used: {type(e).__name__})")
+
+
 def ocr_image(image_bytes):
     img = Image.open(io.BytesIO(image_bytes))
     w, h = img.size
@@ -95,6 +122,10 @@ def ocr_image(image_bytes):
     img = ImageOps.invert(ImageOps.grayscale(img))
     if UPSCALE != 1:
         img = img.resize((img.width * UPSCALE, img.height * UPSCALE))
+    if OCR_API is not None:
+        with OCR_LOCK:
+            OCR_API.SetImage(img)
+            return OCR_API.GetUTF8Text()
     return pytesseract.image_to_string(img, config=OCR_CONFIG)
 
 
@@ -228,7 +259,7 @@ async def handler(event):
     rpc_task = asyncio.create_task(get_discussion_target(msg.id))
     fut = thread_future(msg.id)
 
-    image_bytes = await msg.download_media(bytes)
+    image_bytes = await msg.download_media(bytes, thumb=DOWNLOAD_THUMB)
     t1 = time.perf_counter()
 
     text = await asyncio.to_thread(ocr_image, image_bytes)
@@ -275,8 +306,21 @@ async def warm_up():
         print(f"Download warm-up skipped: {e}")
 
 
+def set_high_priority():
+    """Windows: give this process priority over other programs so nothing slows OCR/network."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
+    except Exception:
+        pass
+
+
 async def main():
-    print("v3")
+    print("v4")
+    set_high_priority()
+    init_ocr()
     await client.start()
     global CHANNEL_INPUT, CHANNEL_ID, GROUP_INPUT
     CHANNEL_INPUT = await client.get_input_entity(CHANNEL)
@@ -292,6 +336,7 @@ async def main():
             GROUP_INPUT = utils.get_input_peer(group)
             client.add_event_handler(group_handler, events.NewMessage(chats=GROUP_INPUT))
             print(f"Listening to discussion group: {getattr(group, 'title', gid)}")
+            print(f"V3")
     except Exception as e:
         print(f"Group listener off (using request lookup only): {e}")
 
