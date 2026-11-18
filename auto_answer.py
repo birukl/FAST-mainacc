@@ -336,7 +336,6 @@ async def main():
             GROUP_INPUT = utils.get_input_peer(group)
             client.add_event_handler(group_handler, events.NewMessage(chats=GROUP_INPUT))
             print(f"Listening to discussion group: {getattr(group, 'title', gid)}")
-            print(f"V3")
     except Exception as e:
         print(f"Group listener off (using request lookup only): {e}")
 
