@@ -276,6 +276,7 @@ async def warm_up():
 
 
 async def main():
+    print("v3")
     await client.start()
     global CHANNEL_INPUT, CHANNEL_ID, GROUP_INPUT
     CHANNEL_INPUT = await client.get_input_entity(CHANNEL)
