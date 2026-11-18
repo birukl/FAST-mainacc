@@ -9,7 +9,6 @@ import json
 import re
 import time
 import logging
-import threading
 
 try:
     import winsound  # Windows beep (not on Linux/cloud)
@@ -48,6 +47,10 @@ UPSCALE = 1
 # download, but TEST that OCR still reads every question correctly before using it.
 DOWNLOAD_THUMB = None
 
+ONE_SHOT = True                    # answer ONE question, then stop the program
+READY_WORDS = ["ready"]            # a text message containing one of these = "get ready" -> warm up again
+WARM_EVERY = 300                   # seconds: keep connections hot while waiting for the question
+
 TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 if os.name == "nt":
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
@@ -82,6 +85,22 @@ FLAT_NAMES = [
 ]
 
 answered = set()
+busy = False   # a question is being processed right now
+done = False   # the one question was answered
+
+
+async def stop_soon():
+    await asyncio.sleep(1.5)
+    print("Answered. Stopping.")
+    await client.disconnect()
+
+
+async def keep_warm():
+    """While waiting for the question: refresh the connections every few minutes."""
+    while not done:
+        await asyncio.sleep(WARM_EVERY)
+        if not done:
+            await warm_up()
 
 
 def alert(text):
@@ -89,29 +108,6 @@ def alert(text):
     if winsound:
         winsound.Beep(1200, 400)
         winsound.Beep(900, 400)
-
-
-OCR_API = None                 # tesserocr engine kept loaded in memory (much faster than pytesseract)
-OCR_LOCK = threading.Lock()
-
-
-def init_ocr():
-    """Optional speed-up: tesserocr runs Tesseract inside this process, so there is no new
-    process + model load for every image. If it is not installed we silently use pytesseract."""
-    global OCR_API
-    try:
-        import tesserocr
-        kwargs = {"lang": "eng", "psm": tesserocr.PSM.SINGLE_BLOCK, "oem": tesserocr.OEM.LSTM_ONLY}
-        path = os.environ.get("TESSDATA_PREFIX")
-        if not path and os.name == "nt":
-            path = r"C:\Program Files\Tesseract-OCR\tessdata"
-        if path:
-            kwargs["path"] = path
-        OCR_API = tesserocr.PyTessBaseAPI(**kwargs)
-        print("OCR engine: tesserocr (in-process, fast)")
-    except Exception as e:
-        OCR_API = None
-        print(f"OCR engine: pytesseract (tesserocr not used: {type(e).__name__})")
 
 
 def ocr_image(image_bytes):
@@ -122,10 +118,6 @@ def ocr_image(image_bytes):
     img = ImageOps.invert(ImageOps.grayscale(img))
     if UPSCALE != 1:
         img = img.resize((img.width * UPSCALE, img.height * UPSCALE))
-    if OCR_API is not None:
-        with OCR_LOCK:
-            OCR_API.SetImage(img)
-            return OCR_API.GetUTF8Text()
     return pytesseract.image_to_string(img, config=OCR_CONFIG)
 
 
@@ -245,47 +237,63 @@ async def send_fast(peer, text, reply_id, give_up=10.0):
 
 @client.on(events.NewMessage(chats=CHANNEL))
 async def handler(event):
+    global busy, done
     msg = event.message
     if not msg.photo:
         if msg.text and not msg.document:
-            print("txt ignored")
+            low = msg.text.lower()
+            if any(w in low for w in READY_WORDS):
+                print(f"[READY] get-ready message seen: {msg.text[:60]!r} -> warming up")
+                asyncio.create_task(warm_up())
+            else:
+                print("txt ignored")
         return
-    if msg.id in answered:
+    if msg.id in answered or done or busy:
         return
-    answered.add(msg.id)
+    answered.add(msg.id)  # mark first so we never comment twice
+    busy = True
 
-    t0 = time.perf_counter()
-    # find the comment thread NOW (two ways at once) while we download + OCR the image
-    rpc_task = asyncio.create_task(get_discussion_target(msg.id))
-    fut = thread_future(msg.id)
+    try:
+        t0 = time.perf_counter()
+        # find the comment thread NOW (two ways at once) while we download + OCR the image
+        rpc_task = asyncio.create_task(get_discussion_target(msg.id))
+        fut = thread_future(msg.id)
 
-    image_bytes = await msg.download_media(bytes, thumb=DOWNLOAD_THUMB)
-    t1 = time.perf_counter()
+        image_bytes = await msg.download_media(bytes, thumb=DOWNLOAD_THUMB)
+        t1 = time.perf_counter()
 
-    text = await asyncio.to_thread(ocr_image, image_bytes)
-    t2 = time.perf_counter()
+        text = await asyncio.to_thread(ocr_image, image_bytes)
+        t2 = time.perf_counter()
 
-    symbol = find_symbol(text)
-    if not symbol:
-        rpc_task.cancel()
-        fut.cancel()
+        symbol = find_symbol(text)
+        if not symbol:
+            rpc_task.cancel()
+            fut.cancel()
+            thread_waiters.pop(msg.id, None)
+            busy = False   # allow the next photo to be tried
+            alert(f"Could not answer post {msg.id}. OCR read: {text.strip()!r}")
+            return
+
+        answer = build_answer(symbol, text)
+        target = await first_target(rpc_task, fut)
         thread_waiters.pop(msg.id, None)
-        alert(f"Could not answer post {msg.id}. OCR read: {text.strip()!r}")
-        return
+        t3 = time.perf_counter()
+        sent = None
+        if target:
+            peer, reply_id = target
+            sent = await send_fast(peer, answer, reply_id)
+        if sent is None:   # fallback: the slow built-in way
+            await client.send_message(CHANNEL, answer, comment_to=msg)
+        t4 = time.perf_counter()
 
-    answer = build_answer(symbol, text)
-    target = await first_target(rpc_task, fut)
-    thread_waiters.pop(msg.id, None)
-    t3 = time.perf_counter()
-    sent = None
-    if target:
-        peer, reply_id = target
-        sent = await send_fast(peer, answer, reply_id)
-    if sent is None:   # fallback: the slow built-in way
-        await client.send_message(CHANNEL, answer, comment_to=msg)
-    t4 = time.perf_counter()
-
-    print(f"{symbol} | download {t1-t0:.2f}s | OCR {t2-t1:.2f}s | wait-thread {t3-t2:.2f}s | send {t4-t3:.2f}s | total {t4-t0:.2f}s")
+        if ONE_SHOT:
+            done = True
+            asyncio.create_task(stop_soon())
+        print(f"{symbol} | download {t1-t0:.2f}s | OCR {t2-t1:.2f}s | wait-thread {t3-t2:.2f}s | send {t4-t3:.2f}s | total {t4-t0:.2f}s")
+    except Exception as e:   # never stay locked after an error: allow the next photo to be tried
+        busy = False
+        print(f"[error] post {msg.id}: {type(e).__name__}: {e}")
+        raise
 
 
 async def warm_up():
@@ -313,14 +321,14 @@ def set_high_priority():
     try:
         import ctypes
         ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)   # do not let the PC sleep while waiting
     except Exception:
         pass
 
 
 async def main():
-    print("v4")
+    print("v5")
     set_high_priority()
-    init_ocr()
     await client.start()
     global CHANNEL_INPUT, CHANNEL_ID, GROUP_INPUT
     CHANNEL_INPUT = await client.get_input_entity(CHANNEL)
@@ -340,6 +348,7 @@ async def main():
         print(f"Group listener off (using request lookup only): {e}")
 
     await warm_up()
+    asyncio.create_task(keep_warm())
 
     name = getattr(entity, "title", None) or CHANNEL
     username = f" (@{entity.username})" if getattr(entity, "username", None) else ""
